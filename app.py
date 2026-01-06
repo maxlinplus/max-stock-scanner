@@ -129,7 +129,7 @@ def call_gemini_api(api_key, prompt):
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
     # 根據模型給予不同的超時寬容度
-    timeout = 120 if "pro" in model_name else 60
+    timeout = 180 if "pro" in model_name else 180
     
     response = requests.post(url, headers=headers, json=data, timeout=timeout)
     if response.status_code == 200:
