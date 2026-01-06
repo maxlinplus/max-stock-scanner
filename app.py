@@ -65,15 +65,40 @@ def parse_article(url):
         date = meta[3].text.strip()
         main_content = soup.find(id="main-content")
         
+        # --- 抓取推文 (含時間) ---
         pushes = main_content.find_all('div', class_='push')
+        
+        # 統計數量
         p_cnt = sum(1 for p in pushes if '推' in p.text)
         b_cnt = sum(1 for p in pushes if '噓' in p.text)
         
+        # 提取推文內容 (V18改動：移除數量限制，抓取所有推文)
+        comments_list = []
+        for p in pushes:
+            try:
+                tag = p.find('span', class_='push-tag').text.strip()
+                user = p.find('span', class_='push-userid').text.strip()
+                content = p.find('span', class_='push-content').text.strip().replace(': ', '')
+                
+                # 抓取 IP/時間
+                ip_time_span = p.find('span', class_='push-ipdatetime')
+                ip_time = ip_time_span.text.strip() if ip_time_span else ""
+                
+                comments_list.append(f"[{ip_time}] {tag} {user}: {content}")
+            except:
+                continue
+
+        # 清理主文 HTML 標籤
         for t in main_content.find_all(['div', 'span'], class_=['article-meta-tag', 'article-meta-value', 'push', 'richcontent']): 
             t.decompose()
         
-        content = main_content.get_text().strip()[:5000]
-        formatted_text = f"\n{'='*30}\n📄 標題: {title}\n📅 時間: {date}\n👤 作者: {author}\n📊 互動: 推 {p_cnt} | 噓 {b_cnt}\n\n{content}\n"
+        body_content = main_content.get_text().strip()
+        
+        # 組合全文：標題 + 內文 + 所有推文
+        comments_text = "\n".join(comments_list) # 這裡不再切片 [:100]
+        
+        formatted_text = f"\n{'='*30}\n📄 標題: {title}\n📅 時間: {date}\n👤 作者: {author}\n📊 互動: 推 {p_cnt} | 噓 {b_cnt}\n\n[內文]:\n{body_content}\n\n[完整推文 ({len(comments_list)}則)]:\n{comments_text}\n"
+        
         return formatted_text, title, date
     except: return None
 
@@ -103,7 +128,10 @@ def call_gemini_api(api_key, prompt):
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    response = requests.post(url, headers=headers, json=data, timeout=60)
+    # 根據模型給予不同的超時寬容度
+    timeout = 120 if "pro" in model_name else 60
+    
+    response = requests.post(url, headers=headers, json=data, timeout=timeout)
     if response.status_code == 200:
         return response.json()['candidates'][0]['content']['parts'][0]['text'], model_name
     else:
@@ -111,11 +139,9 @@ def call_gemini_api(api_key, prompt):
 
 # --- 網頁介面邏輯 ---
 
-# 側邊欄：設定區
 with st.sidebar:
     st.header("⚙️ 參數設定")
     
-    # 自動記憶邏輯
     saved_key = load_key()
     api_key_input = st.text_input("Gemini API Key", value=saved_key, type="password", help="輸入後系統會自動儲存")
     if api_key_input and api_key_input != saved_key:
@@ -125,7 +151,9 @@ with st.sidebar:
     st.session_state.api_key = api_key_input
 
     keyword_input = st.text_input("股票代號 (空白隔開)", value="2330 台積電")
-    limit_count = st.number_input("下載篇數", min_value=1, max_value=20, value=5)
+    
+    # 上限 50，預設 10
+    limit_count = st.number_input("下載篇數", min_value=1, max_value=50, value=10)
     
     st.divider()
     if saved_key:
@@ -133,17 +161,12 @@ with st.sidebar:
     else:
         st.caption("💡 首次輸入後，系統將自動建立 `api_key.txt` 幫您記住。")
 
-# 主畫面
-st.title("📈 PTT 股市反指標觀測站")
-st.markdown("結合 **PTT 爬蟲** 與 **Gemini Pro** 模型，自動判讀散戶情緒。")
+st.title("🛡️ PTT 股市反指標觀測站 (V18 全推文版)")
+st.markdown("結合 **PTT 爬蟲 (全推文)** 與 **Gemini (Pro優先)** 模型，自動判讀散戶情緒。")
 
-# 初始化 session state
-if "scraped_data" not in st.session_state:
-    st.session_state.scraped_data = ""
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+if "scraped_data" not in st.session_state: st.session_state.scraped_data = ""
+if "logs" not in st.session_state: st.session_state.logs = []
 
-# 按鈕：開始搜尋
 if st.button("🚀 開始搜尋 & 下載", use_container_width=True):
     st.session_state.logs = [] 
     st.session_state.scraped_data = ""
@@ -154,7 +177,6 @@ if st.button("🚀 開始搜尋 & 下載", use_container_width=True):
     keywords = keyword_input.split()
     links = set()
     
-    # 1. 搜尋連結
     for kw in keywords:
         status_text.text(f"正在搜尋: {kw}...")
         soup = get_soup(f"https://www.ptt.cc/bbs/Stock/search?q={kw}")
@@ -166,7 +188,6 @@ if st.button("🚀 開始搜尋 & 下載", use_container_width=True):
     if not links:
         st.error("❌ 找不到相關文章")
     else:
-        # 2. 排序與下載
         sorted_links = sorted(list(links), key=extract_timestamp, reverse=True)[:limit_count]
         status_text.text(f"找到 {len(sorted_links)} 篇，開始下載內容...")
         
@@ -184,42 +205,40 @@ if st.button("🚀 開始搜尋 & 下載", use_container_width=True):
             time.sleep(0.2)
             
         st.session_state.scraped_data = full_text
-        st.success("🎉 爬蟲執行完成！")
+        st.success(f"🎉 爬蟲執行完成！已抓取 {len(full_text)} 字元的資料 (含所有推文)。")
 
-# 顯示抓取紀錄
 if st.session_state.logs:
     with st.expander("📋 查看已抓取的文章列表", expanded=True):
         for log in st.session_state.logs:
             st.text(log)
 
-# --- 動作區塊：下載與分析 ---
 if st.session_state.scraped_data:
     st.divider()
     st.subheader("🛠️ 下一步操作")
     
-    # 使用 columns 讓按鈕並排
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        # 分析按鈕
         if st.button("🤖 呼叫 Gemini 進行分析", type="primary", use_container_width=True):
             if not st.session_state.api_key:
                 st.warning("請先在左側輸入 Gemini API Key")
             else:
-                with st.spinner("🧠 AI 正在閱讀文章並分析散戶心理..."):
+                with st.spinner("🧠 AI 正在閱讀龐大的推文數據..."):
                     try:
+                        # V18改動：大幅提升上下文限制到 150,000 字
+                        # Gemini 1.5 Context Window 很大，可以吃得下
                         prompt = f"""
                         角色設定：你是一位精通台股散戶心理學與行為金融學的資深交易員。
-                        任務：分析以下 PTT 股板討論內容。
+                        任務：分析以下 PTT 股板討論內容 (這是完整的推文串，請特別注意情緒的連續變化與多空論戰)。
                         
                         請輸出簡潔報告：
                         1. 【情緒溫度計】 (0-100分)：0=極度恐慌(買點)，100=極度狂熱(賣點)。
-                        2. 【散戶共識】：大家現在主要在看多還是看空？理由是什麼？
+                        2. 【散戶共識】：大家現在主要在看多還是看空？有無反串？
                         3. 【反指標操作建議】：基於「人多的地方不要去」原則，現在適合進場、出場還是觀望？
-                        4. 【關鍵證據】：引用 1-2 則最具代表性的推文或內文。
+                        4. 【關鍵證據】：引用 1-2 則最具代表性的推文 (請包含時間點)。
 
                         資料內容：
-                        {st.session_state.scraped_data[:40000]}
+                        {st.session_state.scraped_data[:150000]}
                         """
                         
                         result, model_used = call_gemini_api(st.session_state.api_key, prompt)
@@ -232,20 +251,17 @@ if st.session_state.scraped_data:
                         st.error(f"分析失敗: {str(e)}")
 
     with col2:
-        # 下載按鈕
-        # 自動產生檔名: ptt_stock_YYYYMMDD_HHMMSS.txt
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_kw = re.sub(r'[\\/*?:"<>|]', "_", keyword_input.replace(" ", "_"))
         filename = f"ptt_{safe_kw}_{timestamp}.txt"
         
         st.download_button(
-            label="📥 下載文字檔 (.txt)",
+            label="📥 下載完整文字檔 (.txt)",
             data=st.session_state.scraped_data,
             file_name=filename,
             mime="text/plain",
             use_container_width=True
         )
 
-# 頁尾
 st.divider()
 st.caption("Powered by Streamlit & Google Gemini API")
