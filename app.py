@@ -4,21 +4,29 @@ from bs4 import BeautifulSoup
 import time
 import re
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# --- 財經套件 ---
+import yfinance as yf
+import pandas as pd
 
 # --- 頁面設定 ---
 st.set_page_config(
-    page_title="PTT 股市反指標觀測站",
+    page_title="PTT 股市戰情室",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- 檔案處理 (自動記憶功能) ---
+TW_TZ = timezone(timedelta(hours=8))
+
+def get_tw_time_str():
+    return datetime.now(TW_TZ).strftime("%Y-%m-%d_%H-%M-%S")
+
+# --- 檔案處理 ---
 KEY_FILE = "api_key.txt"
 
 def load_key():
-    """從檔案讀取 Key"""
     if os.path.exists(KEY_FILE):
         try:
             with open(KEY_FILE, "r", encoding="utf-8") as f:
@@ -27,32 +35,108 @@ def load_key():
     return ""
 
 def save_key(key):
-    """將 Key 寫入檔案"""
     try:
         with open(KEY_FILE, "w", encoding="utf-8") as f:
             f.write(key)
     except: pass
 
-# --- 核心函數 ---
-def get_soup(url):
+# ==========================================
+# 1. 技術面模組 (yfinance)
+# ==========================================
+def calculate_technical_indicators(ticker_symbol):
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://www.ptt.cc/bbs/Stock/index.html',
-            'Connection': 'keep-alive'
-        }
-        cookies = {'over18': '1'}
-        response = requests.get(url, cookies=cookies, headers=headers, timeout=10)
-        if response.status_code != 200: return None
-        return BeautifulSoup(response.text, 'html.parser')
-    except: return None
+        stock_id = f"{ticker_symbol}.TW" if not ticker_symbol.endswith(".TW") else ticker_symbol
+        stock = yf.Ticker(stock_id)
+        df = stock.history(period="3mo")
+        
+        if df.empty or len(df) < 20:
+            return "❌ 無法獲取股價資料 (可能是代號錯誤)"
 
-def extract_timestamp(url):
+        # --- 計算指標 ---
+        df['MA5'] = df['Close'].rolling(window=5).mean()
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA60'] = df['Close'].rolling(window=60).mean()
+        
+        # RSI (14)
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # KD (9)
+        low_min = df['Low'].rolling(window=9).min()
+        high_max = df['High'].rolling(window=9).max()
+        df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
+        df['K'] = df['RSV'].ewm(com=2).mean()
+        df['D'] = df['K'].ewm(com=2).mean()
+
+        t = df.iloc[-1]
+        # 加入當下抓取時間
+        fetch_time = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
+        
+        y_info = ""
+        kd_sig = ""
+        
+        if len(df) > 1:
+            y = df.iloc[-2]
+            change = t['Close'] - y['Close']
+            pct = (change / y['Close']) * 100
+            
+            vol_change = t['Volume'] - y['Volume']
+            vol_str = f"增加 {int(vol_change/1000)}" if vol_change > 0 else f"減少 {int(abs(vol_change)/1000)}"
+            
+            y_info = f"""
+            - 漲跌: {change:.2f} ({pct:.2f}%)
+            - 量能: 較昨日{vol_str}張
+            """
+            
+            if y['K'] < y['D'] and t['K'] > t['D']: kd_sig = "🔥 黃金交叉 (轉強訊號)"
+            elif y['K'] > y['D'] and t['K'] < t['D']: kd_sig = "⚠️ 死亡交叉 (轉弱訊號)"
+        else:
+            y_info = "(無昨日資料)"
+
+        report = f"""
+        【官方技術數據 (抓取時間: {fetch_time})】
+        1. 價格與量能：
+           - 收盤價: {t['Close']:.2f}
+           {y_info}
+           - 今日成交量: {int(t['Volume']/1000)} 張
+
+        2. 均線狀態：
+           - MA5 (週線): {t['MA5']:.2f} ({'站上' if t['Close'] > t['MA5'] else '跌破'})
+           - MA20 (月線): {t['MA20']:.2f}
+           - MA60 (季線): {t['MA60']:.2f}
+
+        3. 技術指標：
+           - RSI (14): {t['RSI']:.2f} ({'過熱' if t['RSI']>70 else '超賣' if t['RSI']<30 else '中性'})
+           - KD (9): K={t['K']:.2f}, D={t['D']:.2f}
+           - 訊號: {kd_sig if kd_sig else '無特殊交叉'}
+        """
+        return report
+
+    except Exception as e:
+        return f"❌ 技術指標計算錯誤: {str(e)}"
+
+# ==========================================
+# 2. PTT 爬蟲模組 (推文完整版)
+# ==========================================
+def get_ptt_soup(url):
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.ptt.cc/'}
+    cookies = {'over18': '1'}
+    try:
+        response = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+        if response.status_code == 200:
+            return BeautifulSoup(response.text, 'html.parser')
+    except: pass
+    return None
+
+def extract_ptt_timestamp(url):
     match = re.search(r'M\.(\d+)', url)
     return int(match.group(1)) if match else 0
 
-def parse_article(url):
-    soup = get_soup(url)
+def parse_ptt_article(url):
+    soup = get_ptt_soup(url)
     if not soup: return None
     try:
         meta = soup.find_all('span', class_='article-meta-value')
@@ -61,11 +145,9 @@ def parse_article(url):
         author = meta[0].text.strip()
         title = meta[2].text.strip()
         date = meta[3].text.strip()
-        main_content = soup.find(id="main-content")
+        main = soup.find(id="main-content")
         
-        # --- 抓取推文 (含時間，抓取全部) ---
-        pushes = main_content.find_all('div', class_='push')
-        
+        pushes = main.find_all('div', class_='push')
         p_cnt = sum(1 for p in pushes if '推' in p.text)
         b_cnt = sum(1 for p in pushes if '噓' in p.text)
         
@@ -75,28 +157,28 @@ def parse_article(url):
                 tag = p.find('span', class_='push-tag').text.strip()
                 user = p.find('span', class_='push-userid').text.strip()
                 content = p.find('span', class_='push-content').text.strip().replace(': ', '')
-                
-                # 抓取 IP/時間
                 ip_time_span = p.find('span', class_='push-ipdatetime')
-                ip_time = ip_time_span.text.strip() if ip_time_span else ""
+                raw_time = ip_time_span.text.strip() if ip_time_span else ""
+                clean_time = " ".join(raw_time.split()) 
+                if not clean_time: clean_time = "No_Time"
                 
-                comments_list.append(f"[{ip_time}] {tag} {user}: {content}")
+                comments_list.append(f"[{clean_time}] {tag} {user} : {content}")
             except: continue
 
-        # 清理主文 HTML
-        for t in main_content.find_all(['div', 'span'], class_=['article-meta-tag', 'article-meta-value', 'push', 'richcontent']): 
+        for t in main.find_all(['div', 'span'], class_=['article-meta-tag', 'article-meta-value', 'push', 'richcontent']): 
             t.decompose()
         
-        body_content = main_content.get_text().strip()
-        
-        # 組合全文：標題 + 內文 + 所有推文 (無限制)
+        content = main.get_text().strip()
         comments_text = "\n".join(comments_list)
         
-        formatted_text = f"\n{'='*30}\n📄 標題: {title}\n📅 時間: {date}\n👤 作者: {author}\n📊 互動: 推 {p_cnt} | 噓 {b_cnt}\n\n[內文]:\n{body_content}\n\n[完整推文 ({len(comments_list)}則)]:\n{comments_text}\n"
-        return formatted_text, title, date
+        full_text = f"\n{'='*40}\n[PTT] 標題: {title}\n作者: {author}\n時間: {date}\n互動: 推{p_cnt}/噓{b_cnt}\n\n[內文]:\n{content}\n\n[推文紀錄 ({len(comments_list)}則)]:\n{comments_text}\n"
+        
+        return full_text, title, date
     except: return None
 
-# --- AI 呼叫函數 (自動備援 + 長時間等待) ---
+# ==========================================
+# 3. AI 分析模組
+# ==========================================
 def find_valid_model(api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
@@ -105,12 +187,9 @@ def find_valid_model(api_key):
             data = response.json()
             if 'models' in data:
                 valid_models = [m['name'].replace('models/', '') for m in data['models'] if 'generateContent' in m.get('supportedGenerationMethods', [])]
-                
-                # 優先使用 Pro，若無則用 Flash
                 if "gemini-1.5-pro" in valid_models: return "gemini-1.5-pro"
                 if "gemini-1.0-pro" in valid_models: return "gemini-1.0-pro"
                 if "gemini-1.5-flash" in valid_models: return "gemini-1.5-flash"
-                
                 if valid_models: return valid_models[0]
         return "gemini-1.5-flash" 
     except: return "gemini-1.5-flash"
@@ -121,135 +200,160 @@ def call_gemini_api(api_key, prompt):
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    # 設定超長 timeout (300秒)，因為 50 篇文章 + 全推文 資料量很大
-    timeout = 300
-    
-    response = requests.post(url, headers=headers, json=data, timeout=timeout)
+    response = requests.post(url, headers=headers, json=data, timeout=120)
     if response.status_code == 200:
         return response.json()['candidates'][0]['content']['parts'][0]['text'], model_name
     else:
-        # 如果 Pro 爆了 (429)，自動降級嘗試 Flash
-        if response.status_code == 429 and "flash" not in model_name:
-            fallback_model = "gemini-1.5-flash"
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{fallback_model}:generateContent?key={api_key}"
-            response = requests.post(url, headers=headers, json=data, timeout=timeout)
-            if response.status_code == 200:
-                return response.json()['candidates'][0]['content']['parts'][0]['text'], fallback_model
-        
-        raise Exception(f"API Error {response.status_code}: {response.text}")
+        raise Exception(f"API Error {response.status_code}")
 
-# --- 網頁介面邏輯 ---
+# ==========================================
+# 4. Streamlit UI
+# ==========================================
 
 with st.sidebar:
-    st.header("⚙️ 參數設定")
+    st.header("⚙️ 系統設定")
     saved_key = load_key()
     api_key_input = st.text_input("Gemini API Key", value=saved_key, type="password")
     if api_key_input and api_key_input != saved_key:
         save_key(api_key_input)
-        st.toast("💾 API Key 已儲存", icon="✅")
+        st.toast("Key 已儲存", icon="✅")
     st.session_state.api_key = api_key_input
 
-    keyword_input = st.text_input("股票代號 (空白隔開)", value="2330 台積電")
-    
-    # --- 您的要求：上限 50，預設 10 ---
-    limit_count = st.number_input("下載篇數", min_value=1, max_value=50, value=10)
+    keyword_input = st.text_input("股票代號 (例: 2330)", value="2330")
+    limit_ptt = st.number_input("PTT 篇數", min_value=1, max_value=50, value=15)
     
     st.divider()
-    if saved_key:
-        st.caption("✅ 目前已載入自動儲存的 Key")
 
-st.title("🛡️ PTT 股市反指標觀測站 (V20 終極版)")
-st.markdown("已啟用 **全推文抓取** 與 **50篇大量分析** 模式。")
+st.title("📊 PTT 股市戰情室 (Final Version)")
+st.markdown("整合 **官方技術數據** 與 **PTT 散戶情緒**，快速判斷多空。")
 
+# 狀態初始化
 if "scraped_data" not in st.session_state: st.session_state.scraped_data = ""
+if "tech_report" not in st.session_state: st.session_state.tech_report = ""
 if "logs" not in st.session_state: st.session_state.logs = []
 
-if st.button("🚀 開始搜尋 & 下載", use_container_width=True):
-    st.session_state.logs = [] 
+# --- 搜尋按鈕 (只負責更新資料，不負責顯示) ---
+if st.button("🚀 啟動戰情分析", use_container_width=True):
+    # 清空舊資料
     st.session_state.scraped_data = ""
+    st.session_state.tech_report = ""
+    st.session_state.logs = []
+    
+    stock_code = re.sub(r"\D", "", keyword_input)
+    if not stock_code:
+        st.error("請輸入正確代號")
+        st.stop()
+
+    # 1. 抓技術指標
+    with st.spinner("計算技術指標中..."):
+        tech_report = calculate_technical_indicators(stock_code)
+        st.session_state.tech_report = tech_report
+
+    # 2. 抓 PTT
+    keywords = keyword_input.split()
+    all_text_data = ""
+    ptt_links = set()
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    keywords = keyword_input.split()
-    links = set()
+    status_text.text("搜尋 PTT 中...")
     
     for kw in keywords:
-        status_text.text(f"正在搜尋: {kw}...")
-        soup = get_soup(f"https://www.ptt.cc/bbs/Stock/search?q={kw}")
+        soup = get_ptt_soup(f"https://www.ptt.cc/bbs/Stock/search?q={kw}")
         if soup:
-            for t in soup.find_all('div', class_='title'):
-                a = t.find('a')
-                if a: links.add("https://www.ptt.cc" + a['href'])
+            divs = soup.find_all('div', class_='title')
+            if divs:
+                for t in divs:
+                    a = t.find('a')
+                    if a: ptt_links.add("https://www.ptt.cc" + a['href'])
+        time.sleep(0.2)
     
-    if not links:
-        st.error("❌ 找不到相關文章")
+    sorted_links = sorted(list(ptt_links), key=extract_ptt_timestamp, reverse=True)[:limit_ptt]
+    
+    if not sorted_links:
+        st.warning("❌ 找不到相關文章")
     else:
-        sorted_links = sorted(list(links), key=extract_timestamp, reverse=True)[:limit_count]
-        status_text.text(f"找到 {len(sorted_links)} 篇，開始下載內容...")
-        
-        full_text = ""
         for i, link in enumerate(sorted_links):
-            res = parse_article(link)
+            res = parse_ptt_article(link)
             if res:
                 text, title, date = res
-                full_text += text
-                st.session_state.logs.append(f"✅ [{date}] {title}")
-            else:
-                st.session_state.logs.append(f"❌ 讀取失敗: {link}")
-            progress_bar.progress((i + 1) / len(sorted_links))
-            time.sleep(0.2)
+                all_text_data += text
+                # 存入 logs 以便稍後顯示
+                st.session_state.logs.append(f"📄 [{date}] {title}")
             
-        st.session_state.scraped_data = full_text
-        st.success(f"🎉 下載完成！已抓取 {len(full_text)} 字元 (含所有推文)。")
+            progress = (i + 1) / len(sorted_links)
+            progress_bar.progress(progress)
+            status_text.text(f"下載中... {int(progress*100)}%")
+            time.sleep(0.1)
+        
+        st.session_state.scraped_data = all_text_data
+        status_text.success(f"🎉 搜尋完成！")
+        time.sleep(1) # 讓使用者看到完成訊息
+        status_text.empty() # 清除狀態文字
 
-if st.session_state.logs:
-    with st.expander("📋 查看已抓取的文章列表", expanded=True):
-        for log in st.session_state.logs: st.text(log)
-
-if st.session_state.scraped_data:
-    st.divider()
-    st.subheader("🛠️ 下一步操作")
-    col1, col2 = st.columns([1, 1])
+# --- 顯示區域 (獨立於按鈕之外，確保不會消失) ---
+if st.session_state.tech_report or st.session_state.scraped_data:
+    col1, col2 = st.columns([1, 1]) 
     
+    # 左欄：技術分析
     with col1:
-        if st.button("🤖 呼叫 Gemini 進行分析", type="primary", use_container_width=True):
+        st.subheader("1. 官方技術診斷")
+        st.info(st.session_state.tech_report)
+
+    # 右欄：PTT 列表
+    with col2:
+        st.subheader(f"2. PTT 輿情列表")
+        if st.session_state.logs:
+            with st.container(height=400): # 固定高度卷軸，避免頁面太長
+                for log in st.session_state.logs:
+                    st.text(log)
+        else:
+            st.warning("無相關 PTT 文章")
+
+    st.divider()
+    
+    # 底部按鈕區
+    btn_col1, btn_col2 = st.columns(2)
+    
+    with btn_col1:
+        if st.button("🧠 AI 戰情官深度解讀", type="primary", use_container_width=True):
             if not st.session_state.api_key:
                 st.warning("請先輸入 API Key")
             else:
-                with st.spinner("🧠 資料量較大，AI 正在閱讀並分析 (可能需時 1-3 分鐘)..."):
+                with st.spinner("🤖 AI 正在比對「技術訊號」與「散戶情緒 (含推文)」..."):
                     try:
-                        # 將 token 限制放寬到 20 萬字，確保能吃下 50 篇的全推文
                         prompt = f"""
-                        角色設定：你是一位精通台股散戶心理學與行為金融學的資深交易員。
-                        任務：分析以下 PTT 股板討論內容 (這是完整的推文串，請特別注意情緒的連續變化與多空論戰)。
+                        角色：資深操盤手。
+                        任務：分析 {keyword_input} 走勢。
                         
-                        請輸出簡潔報告：
-                        1. 【情緒溫度計】 (0-100分)：0=極度恐慌(買點)，100=極度狂熱(賣點)。
-                        2. 【散戶共識】：大家現在主要在看多還是看空？有無反串？
-                        3. 【反指標操作建議】：基於「人多的地方不要去」原則，現在適合進場、出場還是觀望？
-                        4. 【關鍵證據】：引用 1-2 則最具代表性的推文 (請包含時間點)。
-
-                        資料內容：
-                        {st.session_state.scraped_data[:200000]}
+                        【資料來源】
+                        1. [官方技術面]:
+                        {st.session_state.tech_report}
+                        
+                        2. [PTT 輿情 (含推文爭論)]:
+                        {st.session_state.scraped_data[:100000]}
+                        
+                        請輸出分析報告：
+                        1. 【多空溫度計】(0-100分)
+                        2. 【技術面診斷】：(引用 MA, RSI, KD, 量能，判斷目前是多頭、空頭還是盤整)。
+                        3. 【散戶共識】：(請引用 PTT 推文內容，鄉民目前看多還是看空？有無反串？)。
+                        4. 【訊號 vs 輿情】：真實技術指標有支撐鄉民的看法嗎？
+                        5. 【操作建議】：基於技術面事實給出建議。
                         """
-                        result, model_used = call_gemini_api(st.session_state.api_key, prompt)
-                        
-                        st.divider()
-                        st.subheader(f"📊 分析報告 (使用模型: {model_used})")
+                        result, model = call_gemini_api(st.session_state.api_key, prompt)
+                        st.subheader("📊 戰情分析報告")
                         st.markdown(result)
                     except Exception as e:
-                        st.error(f"分析失敗: {str(e)}")
-
-    with col2:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        st.error(str(e))
+                        
+    with btn_col2:
+        timestamp = get_tw_time_str()
         safe_kw = re.sub(r'[\\/*?:"<>|]', "_", keyword_input.replace(" ", "_"))
+        
         st.download_button(
-            label="📥 下載完整文字檔 (.txt)",
-            data=st.session_state.scraped_data,
-            file_name=f"ptt_{safe_kw}_{timestamp}.txt",
+            label="📥 下載完整資料 (.txt)",
+            data=f"{st.session_state.tech_report}\n\n{'='*20}\n\n{st.session_state.scraped_data}".encode("utf-8-sig"),
+            file_name=f"report_{safe_kw}_{timestamp}.txt",
             mime="text/plain",
             use_container_width=True
         )
-
-st.divider()
-st.caption("Powered by Streamlit & Google Gemini API")
